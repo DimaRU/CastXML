@@ -42,6 +42,14 @@
 #include "clang/Lex/Preprocessor.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <queue>
+#include <set>
+#include <string>
+#include <vector>
+
 #if LLVM_VERSION_MAJOR >= 16
 #  include <optional>
 namespace cx {
@@ -56,13 +64,38 @@ using optional = llvm::Optional<T>;
 }
 #endif
 
-#include <fstream>
-#include <iomanip>
-#include <iostream>
-#include <queue>
-#include <set>
-#include <string>
-#include <vector>
+#if LLVM_VERSION_MAJOR >= 16
+namespace cx {
+using FileEntryRef = clang::FileEntryRef;
+using OptionalFileEntryRef = clang::OptionalFileEntryRef;
+}
+#elif LLVM_VERSION_MAJOR >= 12
+namespace cx {
+using FileEntryRef = clang::FileEntryRef;
+using OptionalFileEntryRef = llvm::Optional<clang::FileEntryRef>;
+}
+#else
+namespace cx {
+using FileEntryRef = clang::FileEntry const*;
+using OptionalFileEntryRef = clang::FileEntry const*;
+}
+#endif
+
+#if LLVM_VERSION_MAJOR >= 18
+#  define cx_ElaboratedTypeKeyword(x) clang::ElaboratedTypeKeyword::x
+#  define cx_TagTypeKind(x) clang::TagTypeKind::x
+#else
+#  define cx_ElaboratedTypeKeyword(x) clang::ETK_##x
+#  define cx_TagTypeKind(x) clang::TTK_##x
+#endif
+
+#if LLVM_VERSION_MAJOR < 16
+#  define starts_with startswith
+#endif
+
+#if LLVM_VERSION_MAJOR < 18
+#  define isPureVirtual isPure
+#endif
 
 class ASTVisitorBase
 {
@@ -225,6 +258,23 @@ protected:
              << "\"/>\n";
     /* clang-format on */
   }
+
+  std::string getNameOfFileEntryRef(cx::FileEntryRef f) const
+  {
+#if LLVM_VERSION_MAJOR >= 12
+    return std::string(f.getName());
+#else
+    return std::string(f->getName());
+#endif
+  }
+  cx::OptionalFileEntryRef getFileEntryRefForID(clang::FileID id) const
+  {
+#if LLVM_VERSION_MAJOR >= 12
+    return this->CI.getSourceManager().getFileEntryRefForID(id);
+#else
+    return this->CI.getSourceManager().getFileEntryForID(id);
+#endif
+  }
 };
 
 class ASTVisitor : public ASTVisitorBase
@@ -366,7 +416,13 @@ class ASTVisitor : public ASTVisitorBase
   DumpId AddDumpNodeImpl(K k, bool complete);
 
   /** Allocate a dump node for a source file entry.  */
-  unsigned int AddDumpFile(clang::FileEntry const* f);
+  unsigned int AddDumpFile(cx::FileEntryRef f);
+#if LLVM_VERSION_MAJOR < 12
+  unsigned int AddDumpFile(clang::FileEntry const& f)
+  {
+    return this->AddDumpFile(&f);
+  }
+#endif
 
   /** Add class template specializations and instantiations for output.  */
   void AddClassTemplateDecl(clang::ClassTemplateDecl const* d,
@@ -546,9 +602,9 @@ class ASTVisitor : public ASTVisitorBase
                              clang::AccessSpecifier alt = clang::AS_none);
 
   bool HaveFloat128Type() const;
-  void PrintFloat128Type(DumpNode const* dn);
-  bool IsFloat128TypedefType(clang::QualType t) const;
-  bool IsFloat128TypedefDecl(clang::TypedefDecl const* td) const;
+  void PrintCastXMLTypedef(clang::TypedefDecl const* d, DumpNode const* dn);
+  bool IsCastXMLTypedefType(clang::QualType t) const;
+  bool IsCastXMLTypedefDecl(clang::TypedefDecl const* td) const;
 
   // Decl node output methods.
   void OutputTranslationUnitDecl(clang::TranslationUnitDecl const* d,
@@ -638,7 +694,7 @@ private:
   QualNodesMap QualNodes;
 
   // Map from clang file entry to our source file index.
-  typedef std::map<clang::FileEntry const*, unsigned int> FileNodesMap;
+  typedef std::map<cx::FileEntryRef, unsigned int> FileNodesMap;
   FileNodesMap FileNodes;
 
   // Node traversal queue.
@@ -648,7 +704,7 @@ private:
   std::queue<CommentEntry> CommentQueue;
 
   // File traversal queue.
-  std::queue<clang::FileEntry const*> FileQueue;
+  std::queue<cx::FileEntryRef> FileQueue;
 
 public:
   ASTVisitor(clang::CompilerInstance& ci, clang::ASTContext& ctx,
@@ -808,7 +864,8 @@ ASTVisitor::DumpId ASTVisitor::AddTypeDumpNode(DumpType dt, bool complete,
     case clang::Type::Elaborated: {
       clang::ElaboratedType const* et = t->getAs<clang::ElaboratedType>();
       if (this->Opts.GccXml ||
-          (et->getKeyword() == clang::ETK_None && !et->getQualifier())) {
+          (et->getKeyword() == cx_ElaboratedTypeKeyword(None) &&
+           !et->getQualifier())) {
         // The gccxml format does not include ElaboratedType elements,
         // so replace this one with the underlying type.  Note that this
         // can cause duplicate PointerType and ReferenceType elements
@@ -927,7 +984,7 @@ ASTVisitor::DumpId ASTVisitor::AddDumpNodeImpl(K k, bool complete)
   return dn->Index;
 }
 
-unsigned int ASTVisitor::AddDumpFile(clang::FileEntry const* f)
+unsigned int ASTVisitor::AddDumpFile(cx::FileEntryRef f)
 {
   unsigned int& index = this->FileNodes[f];
   if (index == 0) {
@@ -1161,10 +1218,10 @@ void ASTVisitor::ProcessCommentQueue()
       clang::SourceManager const& sm = this->CI.getSourceManager();
       clang::FileID bid = bfl.getFileID();
       clang::FileID eid = efl.getFileID();
-      clang::FileEntry const* bf = sm.getFileEntryForID(bid);
-      clang::FileEntry const* ef = sm.getFileEntryForID(eid);
+      cx::OptionalFileEntryRef bf = this->getFileEntryRefForID(bid);
+      cx::OptionalFileEntryRef ef = this->getFileEntryRefForID(eid);
       if (bf && bf == ef) {
-        unsigned int fi = this->AddDumpFile(bf);
+        unsigned int fi = this->AddDumpFile(*bf);
         unsigned int boff = sm.getFileOffset(bfl);
         unsigned int eoff = sm.getFileOffset(efl);
         /* clang-format off */
@@ -1194,13 +1251,13 @@ void ASTVisitor::ProcessFileQueue()
     /* clang-format on */
   }
   while (!this->FileQueue.empty()) {
-    clang::FileEntry const* f = this->FileQueue.front();
+    cx::FileEntryRef f = this->FileQueue.front();
     this->FileQueue.pop();
     /* clang-format off */
     this->OS <<
       "  <File"
       " id=\"f" << this->FileNodes[f] << "\""
-      " name=\"" << encodeXML(std::string(f->getName())) << "\""
+      " name=\"" << encodeXML(this->getNameOfFileEntryRef(f)) << "\""
       "/>\n"
       ;
     /* clang-format on */
@@ -1308,7 +1365,13 @@ void ASTVisitor::PrintIdAttribute(DumpNode const* dn)
 
 void ASTVisitor::PrintNameAttribute(std::string const& name)
 {
-  std::string n = stringReplace(name, "__castxml__float128_s", "__float128");
+  std::string n = name;
+  n = stringReplace(n, "__castxml__float128_s", "__float128");
+  n = stringReplace(n, "__castxml_Float32_s", "_Float32");
+  n = stringReplace(n, "__castxml_Float32x_s", "_Float32x");
+  n = stringReplace(n, "__castxml_Float64_s", "_Float64");
+  n = stringReplace(n, "__castxml_Float64x_s", "_Float64x");
+  n = stringReplace(n, "__castxml_Float128_s", "_Float128");
   this->OS << " name=\"" << encodeXML(n) << "\"";
 }
 
@@ -1326,12 +1389,10 @@ void ASTVisitor::PrintMangledAttribute(clang::NamedDecl const* d)
     this->MangleContext->mangleName(d, rso);
   }
 
-  if (!this->HaveFloat128Type()) {
-    // We cannot mangle __float128 correctly because Clang does not have
-    // it as an internal type, so skip mangled attributes involving it.
-    if (s.find("__float128") != s.npos) {
-      s = "";
-    }
+  // We cannot mangle some types correctly because Clang does not have
+  // them as internal types, so skip mangled attributes involving them.
+  if (s.find("__castxml") != std::string::npos) {
+    s = "";
   }
 
   // Strip a leading 1 byte in MS mangling.
@@ -1403,9 +1464,9 @@ void ASTVisitor::PrintLocationAttribute(clang::Decl const* d)
   clang::SourceLocation sl = d->getLocation();
   if (sl.isValid()) {
     clang::FullSourceLoc fsl = this->CTX.getFullLoc(sl).getExpansionLoc();
-    if (clang::FileEntry const* f =
-          this->CI.getSourceManager().getFileEntryForID(fsl.getFileID())) {
-      unsigned int id = this->AddDumpFile(f);
+    if (cx::OptionalFileEntryRef f =
+          this->getFileEntryRefForID(fsl.getFileID())) {
+      unsigned int id = this->AddDumpFile(*f);
       unsigned int line = fsl.getExpansionLineNumber();
       /* clang-format off */
       this->OS <<
@@ -1714,14 +1775,30 @@ bool ASTVisitor::HaveFloat128Type() const
 #endif
 }
 
-void ASTVisitor::PrintFloat128Type(DumpNode const* dn)
+void ASTVisitor::PrintCastXMLTypedef(clang::TypedefDecl const* d,
+                                     DumpNode const* dn)
 {
   this->OS << "  <FundamentalType";
   this->PrintIdAttribute(dn);
-  this->OS << " name=\"__float128\" size=\"128\" align=\"128\"/>\n";
+  if (d->getName() == "__castxml__float80") {
+    this->OS << " name=\"__float80\" size=\"128\" align=\"128\"";
+  } else if (d->getName() == "__castxml__float128") {
+    this->OS << " name=\"__float128\" size=\"128\" align=\"128\"";
+  } else if (d->getName() == "__castxml_Float32") {
+    this->OS << " name=\"_Float32\" size=\"32\" align=\"32\"";
+  } else if (d->getName() == "__castxml_Float32x") {
+    this->OS << " name=\"_Float32x\" size=\"64\" align=\"64\"";
+  } else if (d->getName() == "__castxml_Float64") {
+    this->OS << " name=\"_Float64\" size=\"64\" align=\"64\"";
+  } else if (d->getName() == "__castxml_Float64x") {
+    this->OS << " name=\"_Float64x\" size=\"128\" align=\"128\"";
+  } else if (d->getName() == "__castxml_Float128") {
+    this->OS << " name=\"_Float128\" size=\"128\" align=\"128\"";
+  }
+  this->OS << "/>\n";
 }
 
-bool ASTVisitor::IsFloat128TypedefType(clang::QualType t) const
+bool ASTVisitor::IsCastXMLTypedefType(clang::QualType t) const
 {
   if (t->getTypeClass() == clang::Type::Elaborated) {
     t = t->getAs<clang::ElaboratedType>()->getNamedType();
@@ -1730,15 +1807,15 @@ bool ASTVisitor::IsFloat128TypedefType(clang::QualType t) const
     clang::TypedefType const* tdt = t->getAs<clang::TypedefType>();
     if (clang::TypedefDecl const* td =
           clang::dyn_cast<clang::TypedefDecl>(tdt->getDecl())) {
-      return this->IsFloat128TypedefDecl(td);
+      return this->IsCastXMLTypedefDecl(td);
     }
   }
   return false;
 }
 
-bool ASTVisitor::IsFloat128TypedefDecl(clang::TypedefDecl const* td) const
+bool ASTVisitor::IsCastXMLTypedefDecl(clang::TypedefDecl const* td) const
 {
-  if (td->getName() == "__castxml__float128" &&
+  if (td->getName().starts_with("__castxml") &&
       clang::isa<clang::TranslationUnitDecl>(td->getDeclContext())) {
     clang::SourceLocation sl = td->getLocation();
     if (sl.isValid()) {
@@ -1958,18 +2035,18 @@ void ASTVisitor::OutputRecordDecl(clang::RecordDecl const* d,
 {
   const char* tag;
   switch (d->getTagKind()) {
-    case clang::TTK_Class:
+    case cx_TagTypeKind(Class):
       tag = "Class";
       break;
-    case clang::TTK_Union:
+    case cx_TagTypeKind(Union):
       tag = "Union";
       break;
-    case clang::TTK_Struct:
+    case cx_TagTypeKind(Struct):
       tag = "Struct";
       break;
-    case clang::TTK_Interface:
+    case cx_TagTypeKind(Interface):
       return;
-    case clang::TTK_Enum:
+    case cx_TagTypeKind(Enum):
       return;
   }
   clang::CXXRecordDecl const* dx = clang::dyn_cast<clang::CXXRecordDecl>(d);
@@ -2060,10 +2137,10 @@ void ASTVisitor::OutputClassTemplateSpecializationDecl(
 void ASTVisitor::OutputTypedefDecl(clang::TypedefDecl const* d,
                                    DumpNode const* dn)
 {
-  // As a special case, replace our compatibility Typedef for __float128
-  // with a FundamentalType so we generate the same thing gccxml did.
-  if (this->IsFloat128TypedefDecl(d)) {
-    this->PrintFloat128Type(dn);
+  // As a special case, replace our compatibility Typedef types
+  // with FundamentalType to pretend we had a builtin type.
+  if (this->IsCastXMLTypedefDecl(d)) {
+    this->PrintCastXMLTypedef(d, dn);
     return;
   }
 
@@ -2143,7 +2220,7 @@ void ASTVisitor::OutputFieldDecl(clang::FieldDecl const* d, DumpNode const* dn)
     unsigned bits = d->getBitWidthValue(this->CTX);
     this->OS << " bits=\"" << bits << "\"";
   }
-  if (this->Opts.CastXml && !this->IsFloat128TypedefType(d->getType())) {
+  if (this->Opts.CastXml && !this->IsCastXMLTypedefType(d->getType())) {
     this->PrintInitAttribute(d->getInClassInitializer());
   }
   this->PrintContextAttribute(d);
@@ -2164,7 +2241,7 @@ void ASTVisitor::OutputVarDecl(clang::VarDecl const* d, DumpNode const* dn)
   this->PrintIdAttribute(dn);
   this->PrintNameAttribute(d->getName().str());
   this->PrintTypeAttribute(d->getType(), dn->Complete);
-  if (!this->IsFloat128TypedefType(d->getType())) {
+  if (!this->IsCastXMLTypedefType(d->getType())) {
     this->PrintInitAttribute(d->getInit());
   }
   this->PrintContextAttribute(d);
@@ -2231,7 +2308,7 @@ void ASTVisitor::OutputCXXMethodDecl(clang::CXXMethodDecl const* d,
   if (d->isVirtual()) {
     flags |= FH_Virtual;
   }
-  if (d->isPure()) {
+  if (d->isPureVirtual()) {
     flags |= FH_Pure;
   }
   if (d->isOverloadedOperator()) {
@@ -2261,7 +2338,7 @@ void ASTVisitor::OutputCXXConversionDecl(clang::CXXConversionDecl const* d,
   if (d->isVirtual()) {
     flags |= FH_Virtual;
   }
-  if (d->isPure()) {
+  if (d->isPureVirtual()) {
     flags |= FH_Pure;
   }
   this->OutputFunctionHelper(d, dn, "Converter", flags);
@@ -2297,7 +2374,7 @@ void ASTVisitor::OutputCXXDestructorDecl(clang::CXXDestructorDecl const* d,
   if (d->isVirtual()) {
     flags |= FH_Virtual;
   }
-  if (d->isPure()) {
+  if (d->isPureVirtual()) {
     flags |= FH_Pure;
   }
   this->OutputFunctionHelper(d, dn, "Destructor", flags,
@@ -2470,7 +2547,7 @@ void ASTVisitor::OutputElaboratedType(clang::ElaboratedType const* t,
   }
 
   clang::ElaboratedTypeKeyword k = t->getKeyword();
-  if (k != clang::ETK_None) {
+  if (k != cx_ElaboratedTypeKeyword(None)) {
     this->OS << " keyword=\""
              << encodeXML(clang::TypeWithKeyword::getKeywordName(k).str())
              << '"';

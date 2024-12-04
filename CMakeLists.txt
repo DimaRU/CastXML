@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #=============================================================================
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.10)
 project(CastXML)
 
 include(src/Version.cmake)
@@ -120,6 +120,8 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   if(NOT LLVM_ENABLE_RTTI)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti")
   endif()
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+  string(APPEND CMAKE_CXX_FLAGS " -Zc:preprocessor")
 endif()
 if(CYGWIN OR MINGW)
   # Use GNU extensions on Windows as LLVM upstream does.
